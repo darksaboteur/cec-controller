@@ -1,6 +1,5 @@
 const { exec, spawn } = require('child_process');
 const { EventEmitter } = require('events');
-const readline = require('readline');
 const debug = require('debug');
 const keymap = require('./keymap');
 
@@ -31,6 +30,7 @@ module.exports = class Client
 		this.myDevice = null;
 		this.devices = {};
 
+		exec(`killall cec-client`);	//ensure all cec-client processes are stopped
 		this._scanDevices();
 
 		return this.cec;
@@ -41,7 +41,9 @@ module.exports = class Client
 		return new Promise((resolve, reject) =>
 		{
 			this.enabled = false;
-			if(this.client) this.client.kill();
+			if (this.client) {
+				this.client.kill();
+			}
 
 			this.cec.removeAllListeners();
 			this.cec = null;
@@ -54,12 +56,13 @@ module.exports = class Client
 	{
 		ctl_debug('Performing initial devices scan...');
 
-		exec(`echo scan | cec-client -s -t ${this.type} -o ${this.osdString} -d 1`,
+		exec(`echo scan | cec-client -s -t ${this.type} -o ${this.osdString} -d 1 -p 1 -b 5`,
 			{ maxBuffer: 5 * 1024 * 1024, windowsHide: true }, (error, stdout, stderr) =>
 		{
 			if(error)
 			{
 				ctl_debug(error);
+				console.error(error);
 				return this.cec.emit('error', new Error('App cec-client had an error!'));
 			}
 
@@ -131,7 +134,7 @@ module.exports = class Client
 
 					key = key.toString().replace(/,/g, '');
 
-					var value = params[1].trimLeft();
+					var value = params[1].trim();
 					devicesObject['dev' + devId][key] = value;
 				}
 			});
@@ -166,14 +169,12 @@ module.exports = class Client
 	{
 		this.doneInit = false;
 		this.client = spawn('cec-client',
-			['-t', this.type, '-o', this.osdString, '-d', 8],
+			['-t', this.type, '-o', this.osdString, '-d', 8, '-p', 1, '-b', 5],
 			{ stdio: ['pipe', 'pipe', 'ignore'] });
 
 		this.client.stdin.setEncoding('utf8');
-
-		this.client.stdout.once('data', () =>
-			ctl_debug('cec-client background process started')
-		);
+		this.client.stdout.once('data', () => ctl_debug('cec-client background process started'));
+		this.client.stdout.on('data', (data) => this._parseClientOutput(String(data)));
 		this.client.once('close', (code) =>
 		{
 			this.client = null;
@@ -182,191 +183,185 @@ module.exports = class Client
 			if(this.doneInit && this.enabled) this._createClient();
 			else if(this.enabled) this.cec.emit('error', new Error(`App cec-client exited with code: ${code}`));
 		});
-
-		const rl = readline.createInterface({
-			input: this.client.stdout,
-			crlfDelay: Infinity
-		});
-
-		rl.on('line', this._parseClientOutput);
-		rl.once('close', () => rl.removeListener('line', this._parseClientOutput));
 	}
 
-	_parseClientOutput(line)
+	_parseClientOutput(data)
 	{
-		if(line.length < 5) return;
-
-		if(!line.startsWith(`power status:`))
-			client_debug(line);
-
-		if(!this.doneInit)
+		var lines = data.split('\n');
+		lines.forEach(line =>
 		{
-			if(this.myDevice && line.includes('waiting for input'))
+			if(line.length < 5) return;
+
+			//console.log('data: ' + line);
+
+			if(!this.doneInit)
 			{
-				this.doneInit = true;
-				ctl_debug('cec-client init successful');
-				this.cec.emit('ready', this.devices);
+				if(this.myDevice && line.includes('waiting for input'))
+				{
+					this.doneInit = true;
+					ctl_debug('cec-client init successful');
+					this.cec.emit('ready', this.devices);
+				}
+
+				return;
 			}
 
-			return;
-		}
-
-		if(line.startsWith(`power status:`))
-		{
-			var logicalAddress = this.devices[this.controlledDevice].logicalAddress;
-			var value = this._getLineValue(line);
-
-			if(this.devices[this.controlledDevice].powerStatus !== value)
+			if(line.startsWith('TRAFFIC:'))
 			{
-				this.devices[this.controlledDevice].powerStatus = value;
-				ctl_debug(`Updated dev${logicalAddress} powerStatus using stdout to: ${value}`);
-			}
-
-			this.cec.emit(`${logicalAddress}:powerStatus`, value);
-		}
-		else if(this.devices.hasOwnProperty('dev0') && line.startsWith('TRAFFIC:'))
-		{
-			if(line.includes('>>'))
-			{
-				var destAddress = this.devices[this.myDevice].logicalAddress;
-				var value = this._getLineValue(line).toUpperCase();
-
-				if(line.includes(`>> 0${destAddress}:44:`))
-				{
-					var keyName = keymap.getName(value);
-
-					this.cec.emit('keypress', keyName);
-
-					if(!this.keyReleaseTimeout)
-						this.cec.emit('keydown', keyName);
-				}
-				else if(line.includes(`>> 0${destAddress}:8b:`))
-				{
-					if(this.keyReleaseTimeout)
-						clearTimeout(this.keyReleaseTimeout);
-
-					this.keyReleaseTimeout = setTimeout(() =>
+				if (this.devices.hasOwnProperty('dev0')) {
+					if(line.includes('>>'))
 					{
-						this.cec.emit('keyup', keymap.getName(value));
-						this.keyReleaseTimeout = null;
-					}, 600);
-				}
-				else if(line.includes('>> 0f:36'))
-				{
-					ctl_debug('Received standby request on broadcast');
-					ctl_debug('Checking devices powerStatus....');
+						var destAddress = this.devices[this.myDevice].logicalAddress;
+						var value = this._getLineValue(line).toUpperCase();
 
-					this._checkDevicesStatus(null, 'standby');
-				}
-				else if(line.includes('f:84:'))
-				{
-					var logicalAddress = line.substring(line.indexOf('>> ') + 3, line.indexOf('f:84:'));
-					if(logicalAddress && logicalAddress.length === 1)
-					{
-						ctl_debug('Received report address request on broadcast');
-						var lineCmd = line.split('>> ')[1];
-
-						if(
-							this.devices.hasOwnProperty('dev' + logicalAddress)
-							&& this.devices['dev' + logicalAddress].address === 'f.f.f.f'
-							&& lineCmd.endsWith(`:0${logicalAddress}`)
-						) {
-							var addArr = lineCmd.substring(
-								lineCmd.indexOf('f:84:') + 5, lineCmd.indexOf(`:0${logicalAddress}`)
-							).split(':');
-
-							if(addArr.length === 2)
-							{
-								var newAddr = addArr[0].charAt(0) + '.' + addArr[0].charAt(1) +
-									'.' + addArr[1].charAt(0) + '.' + addArr[1].charAt(1);
-
-								this.devices['dev' + logicalAddress].address = newAddr;
-								ctl_debug(`Updated dev${logicalAddress} address to: ${newAddr}`);
-							}
-						}
-
-						if(line.includes(`>> ${logicalAddress}f:84:`))
-							this._checkDevicesStatus(`dev${logicalAddress}`);
-					}
-				}
-				else if(line.includes('f:82:'))
-				{
-					var addArr = line.substring(line.indexOf('f:82:') + 5).split(':');
-					if(addArr.length === 2)
-					{
-						var detAddr = addArr[0].charAt(0) + '.' + addArr[0].charAt(1) +
-							'.' + addArr[1].charAt(0) + '.' + addArr[1].charAt(1);
-
-						for(var key in this.devices)
+						if(line.includes(`>> 0${destAddress}:44:`))
 						{
-							if(
-								typeof this.devices[key] === 'object'
-								&& this.devices[key].hasOwnProperty('activeSource')
-								&& this.devices[key].hasOwnProperty('address')
-							) {
-								if(
-									this.devices[key].address !== detAddr
-									&& this.devices[key].activeSource === 'yes'
-								) {
-									this.devices[key].activeSource = 'no';
-									ctl_debug(`Changed ${key} activeSource to: no`);
-								}
-								else if(
-									this.devices[key].address === detAddr
-									&& this.devices[key].activeSource === 'no'
-								) {
-									this.devices[key].activeSource = 'yes';
-									ctl_debug(`Changed ${key} activeSource to: yes`);
-								}
+							var keyName = keymap.getName(value);
+
+							this.cec.emit('keypress', keyName);
+
+							if(!this.keyReleaseTimeout)
+								this.cec.emit('keydown', keyName);
+						}
+						else if(line.includes(`>> 0${destAddress}:8b:`))
+						{
+							if(this.keyReleaseTimeout)
+								clearTimeout(this.keyReleaseTimeout);
+
+							this.keyReleaseTimeout = setTimeout(() =>
+							{
+								this.cec.emit('keyup', keymap.getName(value));
+								this.keyReleaseTimeout = null;
+							}, 600);
+						}
+						else if(line.includes('>> 0f:36'))
+						{
+							ctl_debug('Received standby request on broadcast');
+							ctl_debug('Checking devices powerStatus....');
+
+							this._checkDevicesStatus(null, 'standby');
+						}
+						else if(line.includes('f:84:'))
+						{
+							var logicalAddress = line.substring(line.indexOf('>> ') + 3, line.indexOf('f:84:'));
+							if(logicalAddress && logicalAddress.length === 1)
+							{
+								ctl_debug('Received report address request on broadcast');
+
+								if(line.includes(`>> ${logicalAddress}f:84:`))
+									this._checkDevicesStatus(`dev${logicalAddress}`);
 							}
 						}
 					}
-				}
-			}
-			else if(line.includes('<<') && !this.togglingPower)
-			{
-				var srcAddress = this.devices[this.myDevice].logicalAddress;
-				var destAddress = this.devices[this.controlledDevice].logicalAddress;
-
-				if(line.includes(`<< ${srcAddress}0:04`))
-				{
-					for(var key in this.devices)
+					else if(line.includes('<<') && !this.togglingPower)
 					{
-						if(
-							typeof this.devices[key] === 'object'
-							&& this.devices[key].hasOwnProperty('activeSource')
-							&& this.devices[key].activeSource === 'yes'
-						) {
-							this.devices[key].activeSource = 'no';
-							ctl_debug(`Changed ${key} activeSource to: no`);
-							break;
+						var srcAddress = this.devices[this.myDevice].logicalAddress;
+						var destAddress = this.devices[this.controlledDevice].logicalAddress;
+
+						if(line.includes(`<< ${srcAddress}0:04`))
+						{
+							if(this.devices[this.myDevice].activeSource !== 'yes')
+								ctl_debug(`Updated dev${srcAddress} activeSource using stdout to: yes`);
+
+							this.devices[this.myDevice].activeSource = 'yes';
+
+							this.cec.emit(`${srcAddress}:activeSource`, 'yes');
+						}
+						else if(line.includes(`<< ${srcAddress}0:9d`))
+						{
+							if(this.devices[this.myDevice].activeSource !== 'no')
+								ctl_debug(`Updated dev${srcAddress} activeSource using stdout to: no`);
+
+							this.devices[this.myDevice].activeSource = 'no';
+							this.cec.emit(`${srcAddress}:activeSource`, 'no');
+						}
+						else if(line.includes(`<< ${srcAddress}${destAddress}:44`))
+						{
+							var value = this._getLineValue(line).toUpperCase();
+							var keyName = keymap.getName(value);
+
+							ctl_debug(`Send "${keyName}" key to dev${destAddress}`);
+							this.cec.emit('sendKey', keyName);
 						}
 					}
+				} 
+				else {
+					if(line.includes('>>'))
+					{
+						var audioDevice = 5;
+						var myAddress = this.devices[this.myDevice].logicalAddress;
+						var value = this._getLineValue(line).toUpperCase();
 
-					if(this.devices[this.myDevice].activeSource !== 'yes')
-						ctl_debug(`Updated dev${srcAddress} activeSource using stdout to: yes`);
+						if(line.includes(`>> ${audioDevice}`) && ['standby', null].includes(this.devices[`dev${audioDevice}`].powerStatus))		// message from amp while in standby (or unknown) - trigger a state update
+						{
+							if (! line.includes(`>> ${audioDevice}${myAddress}:90:`)) {
+								this._checkDevicesStatus(`dev${audioDevice}`);
+							}
+						}
 
-					this.devices[this.myDevice].activeSource = 'yes';
-					this.cec.emit(`${srcAddress}:activeSource`, 'yes');
-				}
-				else if(line.includes(`<< ${srcAddress}0:9d`))
-				{
-					if(this.devices[this.myDevice].activeSource !== 'no')
-						ctl_debug(`Updated dev${srcAddress} activeSource using stdout to: no`);
+						if(line.includes(`>> ${audioDevice}${myAddress}:7a:`))		// handle report audio status
+						{
+							value = parseInt(value, 16);
 
-					this.devices[this.myDevice].activeSource = 'no';
-					this.cec.emit(`${srcAddress}:activeSource`, 'no');
-				}
-				else if(line.includes(`<< ${srcAddress}${destAddress}:44`))
-				{
-					var value = this._getLineValue(line).toUpperCase();
-					var keyName = keymap.getName(value);
+							let muted = value >= 128;
+							let volume = value % 128;
 
-					ctl_debug(`Send "${keyName}" key to dev${destAddress}`);
-					this.cec.emit('sendKey', keyName);
+							if(this.devices[`dev${audioDevice}`].muted !== muted)
+							{
+								this.devices[`dev${audioDevice}`].muted = muted;
+								this.cec.emit(`${audioDevice}:muted`, muted);
+							}
+
+							if(this.devices[`dev${audioDevice}`].volume !== volume)
+							{
+								this.devices[`dev${audioDevice}`].volume = volume;	
+								this.cec.emit(`${audioDevice}:volume`, volume);
+							}			
+						}
+						else if(line.includes(`>> ${audioDevice}${myAddress}:90:`))		// handle report power status
+						{
+							value = this._getPowerStatusName(value);
+
+							let oldValue = this.devices[`dev${audioDevice}`].powerStatus;
+							if(this.devices[`dev${audioDevice}`].powerStatus !== value)
+							{	
+								this.devices[`dev${audioDevice}`].powerStatus = value;
+								ctl_debug(`Updated dev${audioDevice} powerStatus using stdout to: ${value}`);
+							}
+							// always emit this event as getStatus() needs it
+							this.cec.emit(`${audioDevice}:powerStatus`, value, oldValue);
+
+							var self = this;
+							if (value.startsWith('in transition')) {
+								setTimeout(function() {
+									self._checkDevicesStatus(`dev${audioDevice}`);
+								}, 1000);
+							}
+						}
+						else if (line.includes(`>> ${audioDevice}f:72:`))	// system audio mode broadcast - query power status now as it has likely gone offline
+						{
+							this._checkDevicesStatus(`dev${audioDevice}`);		
+						}
+					}
 				}
 			}
+		});
+	}
+
+	_getPowerStatusName(code)
+	{
+		switch(code) {
+			case '00' :
+				return 'on';
+			case '01' :
+				return 'standby';
+			case '02' :
+				return 'in transition from standby to on';
+			case '03' :
+				return 'in transition from on to standby';
 		}
+		console.error('could not determine power status from: ' + code);
+		return null;
 	}
 
 	_getLineValue(line)
@@ -468,7 +463,8 @@ module.exports = class Client
 			volumeDown: this.command.bind(this, 'voldown', null),
 			mute: this.command.bind(this, 'mute', null),
 			getKeyNames: keymap.getNamesArray.bind(this),
-			command: (args) => { return this.command(args, null); }
+			getMyDevice: this._getMyDevice.bind(this, this.devices, null),
+			command: (action, logicalAddress) => { return this.command(action, logicalAddress); }
 		}
 	}
 
@@ -476,18 +472,18 @@ module.exports = class Client
 	{
 		return new Promise((resolve, reject) =>
 		{
-			if(!action || typeof action !== 'string') resolve(null);
-			else
-			{
-				var cmd = '';
-				if(logicalAddress) cmd = `${action} ${logicalAddress}`;
-				else cmd = action;
+			if (! action || typeof action !== 'string') {
+				resolve(null);
+			} 
+			else {
+				var cmd = logicalAddress ? `${action} ${logicalAddress}` : action;
 
-				if(!this.togglingPower)
+				if (! this.togglingPower) {
+					//console.log(`Running command: ${cmd}`);
 					ctl_debug(`Running command: ${cmd}`);
+				}
 
 				this.client.stdin.write(cmd);
-
 				this.client.stdout.once('data', () => resolve(true));
 			}
 		});
@@ -518,14 +514,8 @@ module.exports = class Client
 					{
 						this.getStatus(deviceId).then(value =>
 						{
-							if(powerStatus === 'standby' && value === 'unknown')
-							{
-								ctl_debug(`Could not detect ${deviceId} powerStatus!`);
-							}
-							else if(value !== powerStatus && !timedOut)
-							{
+							if(value !== powerStatus && !timedOut)
 								return waitPower();
-							}
 
 							clearTimeout(actionTimeout);
 							this.togglingPower = false;
@@ -537,8 +527,8 @@ module.exports = class Client
 							}
 							else
 							{
-								ctl_debug(`${deviceId} powerStatus changed to: ${value}`);
-								resolve(value);
+								ctl_debug(`${deviceId} powerStatus changed to: ${powerStatus}`);
+								resolve(powerStatus);
 							}
 						});
 					}
@@ -632,7 +622,7 @@ module.exports = class Client
 				resolve(value);
 			});
 
-			this.command(`pow ${logicalAddress}`);
+			this.command(`tx ${this.devices[this.myDevice].logicalAddress}${logicalAddress}:8F`, null);
 		});
 	}
 
